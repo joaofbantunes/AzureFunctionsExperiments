@@ -1,0 +1,3 @@
+name: AzureFunctionsExperiments
+runtime: nodejs
+description: Messing around with Azure Functions
