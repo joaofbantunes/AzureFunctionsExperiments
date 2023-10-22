@@ -4,6 +4,8 @@ import * as web from "@pulumi/azure-native/web";
 import * as storage from "@pulumi/azure-native/storage";
 import * as insights from "@pulumi/azure-native/insights";
 import * as operationalinsights from "@pulumi/azure-native/operationalinsights";
+import * as authorization from "@pulumi/azure-native/authorization";
+import * as managedidentity from "@pulumi/azure-native/managedidentity";
 
 const resourceGroup = new resources.ResourceGroup(
   "azure-functions-experiments"
@@ -34,6 +36,18 @@ const storageAccount = new storage.StorageAccount("fnsa", {
   },
 });
 
+// az role definition list --name "Storage Blob Data Reader" --output json
+// 2a2b9908-6ea1-4ae2-8e65-a410df84e7d1
+// az role definition list --name "Storage Blob Data Owner" --output json
+// b7e6dc6d-f1e8-4753-8033-0f276bb0955b
+// using owner so the function can also write to storage (i.e. for AzureWebJobsStorage__accountName, see link below),
+// but should use reader if we only need to download the package
+// https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference?tabs=blob&pivots=programming-language-csharp#connecting-to-host-storage-with-an-identity
+const storageAccountReadRoleDefinition = authorization.getRoleDefinitionOutput({
+  roleDefinitionId: "b7e6dc6d-f1e8-4753-8033-0f276bb0955b",
+  scope: storageAccount.id,
+});
+
 const plan = new web.AppServicePlan("appservice-plan", {
   resourceGroupName: resourceGroup.name,
   sku: {
@@ -42,7 +56,7 @@ const plan = new web.AppServicePlan("appservice-plan", {
   },
   kind: "Linux",
   // for Linux, we need to change the plan to have reserved = true ¯\_(ツ)_/¯
-  reserved: true
+  reserved: true,
 });
 
 const container = new storage.BlobContainer("artifact-container", {
@@ -58,14 +72,17 @@ const goBlob = new storage.Blob("goBlob", {
   source: new pulumi.asset.FileArchive("../go/bin"),
 });
 
-const goBlobSignedUrl = signedBlobReadUrl(
+const goBlobUrl = signedBlobReadUrl(
   goBlob,
   container,
   storageAccount,
   resourceGroup
 );
 
-const storageConnectionString = getConnectionString(resourceGroup.name, storageAccount.name);
+const storageConnectionString = getConnectionString(
+  resourceGroup.name,
+  storageAccount.name
+);
 
 const goApi = new web.WebApp("go-api", {
   resourceGroupName: resourceGroup.name,
@@ -75,14 +92,14 @@ const goApi = new web.WebApp("go-api", {
     appSettings: [
       { name: "AzureWebJobsStorage", value: storageConnectionString },
       { name: "FUNCTIONS_WORKER_RUNTIME", value: "custom" },
-      { name: "WEBSITE_RUN_FROM_PACKAGE", value: goBlobSignedUrl },
+      { name: "WEBSITE_RUN_FROM_PACKAGE", value: goBlobUrl },
       { name: "FUNCTIONS_EXTENSION_VERSION", value: "~4" },
       {
         name: "APPLICATIONINSIGHTS_CONNECTION_STRING",
         value: pulumi.interpolate`InstrumentationKey=${appInsights.instrumentationKey}`,
       },
     ],
-    functionAppScaleLimit: 1
+    functionAppScaleLimit: 1,
   },
 });
 
@@ -93,23 +110,51 @@ const csharpBlob = new storage.Blob("csharpBlob", {
   source: new pulumi.asset.FileArchive("../csharp/published"),
 });
 
-const csharpBlobSignedUrl = signedBlobReadUrl(
+const csharpBlobUrl = unsignedBlobReadUrl(
   csharpBlob,
   container,
-  storageAccount,
-  resourceGroup
+  storageAccount
+);
+
+const csharpManagedIdentity = new managedidentity.UserAssignedIdentity(
+  "csharp-managed-identity",
+  {
+    resourceGroupName: resourceGroup.name,
+    location: resourceGroup.location,
+  }
+);
+
+const storageAccountCsharpReadRoleAssignment = new authorization.RoleAssignment(
+  "csharp-role-assignment",
+  {
+    roleDefinitionId: storageAccountReadRoleDefinition.id,
+    principalId: csharpManagedIdentity.principalId,
+    scope: storageAccount.id,
+    principalType: authorization.PrincipalType.ServicePrincipal,
+  }
 );
 
 const csharpApi = new web.WebApp("csharp-api", {
   resourceGroupName: resourceGroup.name,
   serverFarmId: plan.id,
+  // this is used for the function to use to access services, but it doesn't work to download the binaries from blob storage
+  // to download the binaries from blob storage, we need to set WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID
+  // https://learn.microsoft.com/en-us/azure/app-service/deploy-run-package#access-a-package-in-azure-blob-storage-using-a-managed-identity
+  identity: {
+    type: "UserAssigned",
+    userAssignedIdentities: [csharpManagedIdentity.id],
+  },
   kind: "FunctionApp",
   siteConfig: {
     appSettings: [
-      { name: "AzureWebJobsStorage", value: storageConnectionString },
+      { name: "AzureWebJobsStorage__accountName", value: storageAccount.name },
       { name: "FUNCTIONS_WORKER_RUNTIME", value: "dotnet-isolated" },
-      { name: "WEBSITE_RUN_FROM_PACKAGE", value: csharpBlobSignedUrl },
-      { name: "FUNCTIONS_EXTENSION_VERSION", value: "~4" },      
+      {
+        name: "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID",
+        value: csharpManagedIdentity.id,
+      },
+      { name: "WEBSITE_RUN_FROM_PACKAGE", value: csharpBlobUrl },
+      { name: "FUNCTIONS_EXTENSION_VERSION", value: "~4" },
       {
         name: "APPLICATIONINSIGHTS_CONNECTION_STRING",
         value: pulumi.interpolate`InstrumentationKey=${appInsights.instrumentationKey}`,
@@ -123,8 +168,16 @@ const csharpApi = new web.WebApp("csharp-api", {
 export const goEndpoint = pulumi.interpolate`https://${goApi.defaultHostName}/hello-go`;
 export const csharpEndpoint = pulumi.interpolate`https://${csharpApi.defaultHostName}/hello-csharp`;
 
-// TODO: replace with managed identity
+function unsignedBlobReadUrl(
+  blob: storage.Blob,
+  container: storage.BlobContainer,
+  account: storage.StorageAccount
+): pulumi.Output<string> {
+  return pulumi.interpolate`https://${account.name}.blob.core.windows.net/${container.name}/${blob.name}`;
+}
 
+// example of not using this in the C# function
+// keeping this here for the Go function, just to have both examples, but normally should use the same approach as with the C# function
 function signedBlobReadUrl(
   blob: storage.Blob,
   container: storage.BlobContainer,
@@ -149,9 +202,15 @@ function signedBlobReadUrl(
   return pulumi.interpolate`https://${account.name}.blob.core.windows.net/${container.name}/${blob.name}?${token}`;
 }
 
-function getConnectionString(resourceGroupName: pulumi.Input<string>, accountName: pulumi.Input<string>): pulumi.Output<string> {
+function getConnectionString(
+  resourceGroupName: pulumi.Input<string>,
+  accountName: pulumi.Input<string>
+): pulumi.Output<string> {
   // Retrieve the primary storage account key.
-  const storageAccountKeys = storage.listStorageAccountKeysOutput({ resourceGroupName, accountName });
+  const storageAccountKeys = storage.listStorageAccountKeysOutput({
+    resourceGroupName,
+    accountName,
+  });
   const primaryStorageKey = storageAccountKeys.keys[0].value;
 
   // Build the connection string to the storage account.
