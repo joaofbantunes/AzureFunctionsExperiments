@@ -56,6 +56,7 @@ const plan = new web.AppServicePlan("appservice-plan", {
   },
   kind: "Linux",
   // for Linux, we need to change the plan to have reserved = true ¯\_(ツ)_/¯
+  // if we don't put this, it just silently uses Windows instead of an error
   reserved: true,
 });
 
@@ -147,7 +148,13 @@ const csharpApi = new web.WebApp("csharp-api", {
   kind: "FunctionApp",
   siteConfig: {
     appSettings: [
+      // this is used by the function infra to coordinate stuff, and like for downloading the binaries, it can't use the user assigned identity configured above
+      // if we used system assigned identity, it would work with just AzureWebJobsStorage__accountName, but for user assigned, it needs the rest
+      // alternatively, we could put the connection string in key vault (or directly, though not great for obvious reasons) and set a reference to it in AzureWebJobsStorage
+      // PS: in the portal, it complains that AzureWebJobsStorage is missing, but we can go to the storage account and see that it's working, as there are entries there created automatically
       { name: "AzureWebJobsStorage__accountName", value: storageAccount.name },
+      { name: "AzureWebJobsStorage__credential", value: "managedidentity" },
+      { name: "AzureWebJobsStorage__clientId", value: csharpManagedIdentity.clientId },
       { name: "FUNCTIONS_WORKER_RUNTIME", value: "dotnet-isolated" },
       {
         name: "WEBSITE_RUN_FROM_PACKAGE_BLOB_MI_RESOURCE_ID",
