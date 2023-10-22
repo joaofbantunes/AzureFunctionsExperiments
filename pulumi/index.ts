@@ -161,7 +161,8 @@ const csharpApi = new web.WebApp("csharp-api", {
       },
     ],
     functionAppScaleLimit: 1,
-    linuxFxVersion: "DOTNET-ISOLATED|8.0",
+    linuxFxVersion: "DOTNET-ISOLATED|8.0", // used when running on Linux
+    //netFrameworkVersion: "v8.0", // used when running on Windows
   },
 });
 
