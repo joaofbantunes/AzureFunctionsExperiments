@@ -2,30 +2,22 @@ package main
 
 import (
 	"fmt"
-	"log"
-	"net/http"
 	"os"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
 )
 
 func main() {
-	log.Println("hello!")
-
 	customHandlerPort, exists := os.LookupEnv("FUNCTIONS_CUSTOMHANDLER_PORT")
 	if !exists {
 		customHandlerPort = "8080"
 	}
-	r := gin.Default()
-	r.GET("/hello-go", func(c *gin.Context) {
-		c.String(http.StatusOK, "Hello Go!")
-		// c.JSON(http.StatusOK, gin.H{
-		// 	"message": "pong",
-		// })
-	})
-	r.GET("/api/HelloGo", func(c *gin.Context) {
-		c.String(http.StatusOK, "meh!")
-	})
-	r.Run(fmt.Sprintf(":%s", customHandlerPort))
 
+	app := fiber.New()
+
+	app.Get("/hello-go", func(c *fiber.Ctx) error {
+		return c.SendString("Hello Go!")
+	})
+
+	app.Listen(fmt.Sprintf(":%s", customHandlerPort))
 }
